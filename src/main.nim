@@ -745,6 +745,7 @@ proc asyncRecursiveListObjects(
     delimiter = delimiter,
     start_after = start_after
   )
+  myClient.close()
   var token = results.nextContinuationToken
   # results.contents.map(`$`).apply(proc(item: string) = echo item)
   result.add(results.contents)
