@@ -732,7 +732,7 @@ proc asyncRecursiveListObjects(
   delimiter = "",
   start_after = "",
   continuation_token = "",
-  max_connections = 25
+  max_connections = 100
 ): Future[seq[Contents]] {.async.} =
   var myClient = newAsyncHttpClient()
   var results = await myClient.asyncListObjectsV2(
