@@ -14,6 +14,7 @@ import std/algorithm
 import std/sequtils
 import std/tables
 import std/times
+import std/sugar
 
 when defined(sigv4UseNimCrypto):
   import nimcrypto/sha2 as sha
@@ -370,10 +371,10 @@ proc rawListObjectsV2(
   start_after = "",
   continuation_token = ""
 ): Response =
-  let session = getEnv("AWS_SESSION_TOKEN", session_token)
-  let access = os.getEnv("AWS_ACCESS_KEY_ID", access)
-  let secret = os.getEnv("AWS_SECRET_ACCESS_KEY", secret)
-  let region = os.getEnv("AWS_REGION", region)
+  let session = getEnv("AWS_SESSION_TOKEN", session_token).strip()
+  let access = os.getEnv("AWS_ACCESS_KEY_ID", access).strip()
+  let secret = os.getEnv("AWS_SECRET_ACCESS_KEY", secret).strip()
+  let region = os.getEnv("AWS_REGION", region).strip()
   assert secret != "", "need $AWS_SECRET_ACCESS_KEY in environment"
   assert access != "", "need $AWS_ACCESS_KEY_ID in environment"
   assert region != "", "need $AWS_REGION in environment"
@@ -425,6 +426,74 @@ proc rawListObjectsV2(
   return client.request(
     url, headers=headers
   )
+
+proc asyncRawListObjectsV2(
+  client: AsyncHttpClient,
+  bucket: string,
+  prefix = "",
+  secret = "",
+  access = "",
+  region = "",
+  session_token = "",
+  delimiter = "",
+  start_after = "",
+  continuation_token = ""
+): Future[AsyncResponse] {.async.} =
+  let session = getEnv("AWS_SESSION_TOKEN", session_token).strip()
+  let access = os.getEnv("AWS_ACCESS_KEY_ID", access).strip()
+  let secret = os.getEnv("AWS_SECRET_ACCESS_KEY", secret).strip()
+  let region = os.getEnv("AWS_REGION", region).strip()
+  assert secret != "", "need $AWS_SECRET_ACCESS_KEY in environment"
+  assert access != "", "need $AWS_ACCESS_KEY_ID in environment"
+  assert region != "", "need $AWS_REGION in environment"
+
+  let normal = PathNormal.S3
+  let host = bucket & ".s3." & region & ".amazonaws.com"
+  var query = %*
+    {
+      "list-type": "2",
+      "delimiter": delimiter,
+      "prefix": prefix,
+      "start-after": start_after
+    }
+  if continuation_token != "":
+    query.add("continuation-token", %* continuation_token)
+  let url = $normalizeUrl("https://" & host, query, normal)
+
+  let algo = SHA256
+  let date = makeDateTime()
+
+  var headers = newHttpHeaders({
+    "content-type": "application/x-amz-json-1.0",
+    $SecurityToken: session,
+    "X-Amz-Date": date,
+    "Host": host,
+    $ContentSha256: hash("", SHA256)
+  })
+
+  let
+    scope = credentialScope(region = region, service = "S3", date = date)
+    request = canonicalRequest(
+      HttpMethod.HttpGet,
+      "/",
+      query,
+      headers,
+      "",
+      normalize = normal,
+      digest = algo
+    )
+    sts = stringToSign(request.hash(algo), scope, date = date, digest = algo)
+    signature = calculateSignature(secret = secret, date = date, region = region,
+                                  service = "S3", sts, digest = algo)
+  var auth = $algo & " "
+  auth &= "Credential=" & access / scope & ", "
+  auth &= "SignedHeaders=" & headers.signedHeaders & ", "
+  auth &= "Signature=" & signature
+  headers["Authorization"] = auth
+
+  return (await client.request(
+    url, headers=headers
+  ))
 
 type
   Owner = object
@@ -588,6 +657,31 @@ proc listObjectsV2(
     continuation_token = continuation_token
   ).body.parseListBucketResult(filename = filename)
 
+proc asyncListObjectsV2(
+  client: AsyncHttpClient,
+  bucket: string,
+  prefix = "",
+  secret = "",
+  access = "",
+  region = "",
+  session_token = "",
+  delimiter = "",
+  start_after = "",
+  continuation_token = "",
+  filename = ""
+): Future[ListBucketResult] {.async.} =
+  return (await (await client.asyncRawListObjectsV2(
+    bucket = bucket,
+    prefix = prefix,
+    secret = secret,
+    access = access,
+    region = region,
+    session_token = session_token,
+    delimiter = delimiter,
+    start_after = start_after,
+    continuation_token = continuation_token
+  )).body).parseListBucketResult(filename = filename)
+
 proc recursiveListObjects(
   client: HttpClient,
   bucket: string,
@@ -626,6 +720,62 @@ proc recursiveListObjects(
     # results.contents.map(`$`).apply(proc(item: string) = echo item)
     result.add(results.contents)
     token = results.nextContinuationToken
+
+
+proc asyncRecursiveListObjects(
+  bucket: string,
+  prefix = "",
+  secret = "",
+  access = "",
+  region = "",
+  session_token = "",
+  delimiter = "",
+  start_after = "",
+  continuation_token = ""
+): Future[seq[Contents]] {.async.} =
+  var myClient = newAsyncHttpClient()
+  var results = await myClient.asyncListObjectsV2(
+    bucket = bucket,
+    prefix = prefix,
+    secret = secret,
+    access = access,
+    region = region,
+    session_token = session_token,
+    delimiter = delimiter,
+    start_after = start_after
+  )
+  var token = results.nextContinuationToken
+  # results.contents.map(`$`).apply(proc(item: string) = echo item)
+  result.add(results.contents)
+
+  var more_futures = collect(newSeq):
+    for p in results.commonPrefixes: asyncRecursiveListObjects(
+      bucket = bucket,
+      prefix = p.prefix,
+      secret = secret,
+      access = access,
+      region = region,
+      session_token = session_token,
+      delimiter = delimiter,
+      start_after = start_after
+    )
+
+  if token != "":
+    more_futures.add(asyncRecursiveListObjects(
+      bucket = bucket,
+      prefix = prefix,
+      secret = secret,
+      access = access,
+      region = region,
+      session_token = session_token,
+      delimiter = delimiter,
+      continuation_token = token
+    ))
+
+  let rr = await all(more_futures)
+
+  for r in rr:
+    result.add(r)
 
 const supported_chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 const max_key_length = 1024
@@ -739,7 +889,7 @@ proc rawFlatten(res: var seq[ref Contents], listNode: ListNode, depth = 0) =
     res.rawFlatten(listNode.objs[1].deep, depth+1)
 
 proc flatten(listNode: ListNode): seq[ref Contents] = result.rawFlatten(listNode)
-  
+
 
 proc recursiveList[T](
   client: T,
@@ -865,27 +1015,32 @@ proc recursiveList[T](
 #   )
 
 let bucket = paramStr(1)
-# let prefix = block:
-#   if paramCount() > 1:
-#     paramStr(2)
-#   else:
-#     ""
-
+let prefix = block:
+  if paramCount() > 1:
+    paramStr(2)
+  else:
+    ""
+# echo("bucket: ", bucket)
+# echo("prefix: ", prefix)
 # var client = newHttpClient()
-# let res = client.recursiveListObjects(bucket, prefix)
+# let res = client.listObjectsV2(bucket, prefix, delimiter="/")
+# var client = newAsyncHttpClient()
+let res = waitFor asyncRecursiveListObjects(bucket, prefix, delimiter="/")
+for r in res:
+  echo r.key
+# discard res.map(proc (c: Contents): string = c.key).map(echo)
 
-let (keys, contents) = expandTilde("~/src/nims3/example.full").readContentsFile()
+# let (keys, contents) = expandTilde("~/src/nims3/example.full").readContentsFile()
 
-let keys2 = (
-  (keys, contents)
-  .recursiveList(bucket)
-  .waitFor()
-  .flatten()
-  .map(proc(item: ref Contents): string = item.key)
-  # .apply(proc(item: string) = echo item)
-)
+# let keys2 = (
+#   (keys, contents)
+#   .recursiveList(bucket)
+#   .waitFor()
+#   .flatten()
+#   .map(proc(item: ref Contents): string = item.key)
+# )
 
-echo "equating..."
+# echo "equating..."
 
 # echo keys[1000], " ", keys2[999 .. 1000]
-assert keys == keys2
+# assert keys == keys2
