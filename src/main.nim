@@ -731,7 +731,8 @@ proc asyncRecursiveListObjects(
   session_token = "",
   delimiter = "",
   start_after = "",
-  continuation_token = ""
+  continuation_token = "",
+  max_connections = 25
 ): Future[seq[Contents]] {.async.} =
   var myClient = newAsyncHttpClient()
   var results = await myClient.asyncListObjectsV2(
@@ -748,8 +749,11 @@ proc asyncRecursiveListObjects(
   # results.contents.map(`$`).apply(proc(item: string) = echo item)
   result.add(results.contents)
 
-  var more_futures = collect(newSeq):
-    for p in results.commonPrefixes: asyncRecursiveListObjects(
+  var more_futures = newSeq[Future[seq[Contents]]]()
+  for p in results.commonPrefixes:
+    while activeDescriptors() >= max_connections:
+      await sleepAsync(1)
+    more_futures.add(asyncRecursiveListObjects(
       bucket = bucket,
       prefix = p.prefix,
       secret = secret,
@@ -757,10 +761,13 @@ proc asyncRecursiveListObjects(
       region = region,
       session_token = session_token,
       delimiter = delimiter,
-      start_after = start_after
-    )
+      start_after = start_after,
+      max_connections = max_connections
+    ))
 
   if token != "":
+    while activeDescriptors() >= max_connections:
+      await sleepAsync(1)
     more_futures.add(asyncRecursiveListObjects(
       bucket = bucket,
       prefix = prefix,
@@ -769,7 +776,8 @@ proc asyncRecursiveListObjects(
       region = region,
       session_token = session_token,
       delimiter = delimiter,
-      continuation_token = token
+      continuation_token = token,
+      max_connections = max_connections
     ))
 
   let rr = await all(more_futures)
