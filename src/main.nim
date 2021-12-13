@@ -732,7 +732,7 @@ proc asyncRecursiveListObjects(
   delimiter = "",
   start_after = "",
   continuation_token = "",
-  max_connections = 100
+  max_connections = 50
 ): Future[seq[Contents]] {.async.} =
   var myClient = newAsyncHttpClient()
   var results = await myClient.asyncListObjectsV2(
@@ -753,7 +753,7 @@ proc asyncRecursiveListObjects(
   var more_futures = newSeq[Future[seq[Contents]]]()
   for p in results.commonPrefixes:
     while activeDescriptors() >= max_connections:
-      await sleepAsync(1)
+      await sleepAsync(0)
     more_futures.add(asyncRecursiveListObjects(
       bucket = bucket,
       prefix = p.prefix,
@@ -768,7 +768,7 @@ proc asyncRecursiveListObjects(
 
   if token != "":
     while activeDescriptors() >= max_connections:
-      await sleepAsync(1)
+      await sleepAsync(0)
     more_futures.add(asyncRecursiveListObjects(
       bucket = bucket,
       prefix = prefix,
